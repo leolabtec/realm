@@ -385,7 +385,7 @@ delete_forward() {
     local start_line=$line_number
     while [ $start_line -ge 1 ]; do
         local line_content=$(sed -n "${start_line}p" /root/.realm/config.toml)
-        if [[ $line_content =~ $$    \[endpoints    $$\] ]]; then
+        if [[ $line_content =~ $$  \[endpoints  $$\] ]]; then
             break
         fi
         ((start_line--))
@@ -516,3 +516,205 @@ update_realm() {
         echo "校验和验证失败，下载可能被篡改！"
         exit 1
     fi
+
+    cd /root/realm
+    tar -xvf realm.tar.gz
+    chmod +x realm
+
+    echo -e "realm 更新成功。"
+    update_realm_status
+}
+
+# 面板管理函数
+panel_management() {
+    clear
+    echo "==========================="
+    echo "Realm 面板管理"
+    echo "==========================="
+    echo "1. 启动面板"
+    echo "2. 暂停面板" 
+    echo "3. 安装面板"
+    echo "4. 卸载面板"
+    echo "5. 修改面板配置"
+    echo "0. 返回主菜单"
+    echo "==========================="
+    read -p "请选择操作 [0-5]: " panel_choice
+
+    case $panel_choice in
+        1) start_panel ;;
+        2) stop_panel ;;
+        3) install_panel ;;
+        4) uninstall_panel ;;
+        5) modify_panel_config ;;
+        0) return ;;
+        *) echo "无效的选择" ;;
+    esac
+}
+
+install_panel() {
+    echo "开始安装 Realm 面板..."
+    
+    # 检测系统架构
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)
+            panel_file="realm-panel-linux-amd64.zip"
+            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-amd64.zip.sha256"
+            ;;
+        aarch64|arm64)
+            panel_file="realm-panel-linux-arm64.zip"
+            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-arm64.zip.sha256"
+            ;;
+        *)
+            echo "不支持的系统架构: $arch"
+            return 1
+            ;;
+    esac
+
+    cd /root/realm 
+
+    # 从 GitHub 下载面板文件
+    echo "正在从 GitHub 下载面板文件..."
+    echo "检测到系统架构: $arch，将下载: $panel_file"
+    
+    download_url="https://github.com/wcwq98/realm/releases/download/v2.1/${panel_file}"
+    if ! wget -O "${panel_file}" "$download_url"; then
+        echo "下载失败，请检查网络连接或稍后再试。"
+        return 1
+    fi
+    wget -O "${panel_file}.sha256" "$checksum_url"
+    sha256sum -c "${panel_file}.sha256"
+    if [[ $? -ne 0 ]]; then
+        echo "校验和验证失败，下载可能被篡改！"
+        exit 1
+    fi
+
+    mkdir -p web
+    # 解压并设置权限
+    unzip "${panel_file}" -d /root/realm/web
+    cd web
+    chmod +x realm_web
+    chmod 700 /root/realm/web
+
+    # 生成自签名证书
+    mkdir -p /root/realm/web/certificate
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /root/realm/web/certificate/private.key -out /root/realm/web/certificate/cert.pem -subj "/C=CN/ST=State/L=City/O=Organization/OU=Unit/CN=localhost"
+    chmod 600 /root/realm/web/certificate/*
+
+    # 创建面板配置文件
+    random_password=$(openssl rand -base64 12)
+    echo "[auth]
+password = \"$random_password\"
+
+[server]
+port = 8081
+
+[https]
+enabled = true
+cert_file = \"/root/realm/web/certificate/cert.pem\"
+key_file = \"/root/realm/web/certificate/private.key\"" > /root/realm/web/config.toml
+    chmod 600 /root/realm/web/config.toml
+
+    echo "面板密码为: $random_password，请保存！"
+
+    # 创建服务文件
+    echo "[Unit]
+Description=Realm Web Panel
+After=network.target
+
+[Service]
+Type=simple
+User=realmuser
+Group=realmuser
+WorkingDirectory=/root/realm/web
+ExecStart=/root/realm/web/realm_web
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target" > /etc/systemd/system/realm-panel.service
+
+    systemctl daemon-reload
+    systemctl enable realm-panel
+    systemctl start realm-panel
+
+    update_panel_status
+    echo "Realm 面板安装完成。"
+}
+
+# 启动面板
+start_panel() {
+    systemctl start realm-panel
+    echo "面板服务已启动。"
+    check_panel_service_status
+}
+
+# 停止面板
+stop_panel() {
+    systemctl stop realm-panel
+    echo "面板服务已停止。"
+    check_panel_service_status
+}
+
+# 卸载面板
+uninstall_panel() {
+    systemctl stop realm-panel
+    systemctl disable realm-panel
+    rm -f /etc/systemd/system/realm-panel.service
+    systemctl daemon-reload
+
+    rm -rf /root/realm/web
+    echo "面板已被卸载。"
+
+    update_panel_status
+}
+
+# 修改面板配置
+modify_panel_config() {
+    echo "请输入新密码："
+    read -e -p "新密码: " new_password
+    if [[ -z "$new_password" || ${#new_password} -lt 8 ]]; then
+        echo "密码不能为空且至少8位。"
+        return
+    fi
+    echo "[auth]
+password = \"$new_password\"
+
+[server]
+port = 8081
+
+[https]
+enabled = true
+cert_file = \"/root/realm/web/certificate/cert.pem\"
+key_file = \"/root/realm/web/certificate/private.key\"" > /root/realm/web/config.toml
+    chmod 600 /root/realm/web/config.toml
+    echo "面板配置已修改。"
+}
+
+# 主程序
+main() {
+    check_dependencies
+    init_env
+
+    while true; do
+        show_menu
+        read -p "请输入选项 [0-11]: " choice
+
+        case $choice in
+            1) deploy_realm ;;
+            2) add_forward ;;
+            3) add_port_range_forward ;;
+            4) delete_forward ;;
+            5) start_service ;;
+            6) stop_service ;;
+            7) restart_service ;;
+            8) update_realm ;;
+            9) uninstall_realm ;;
+            10) Update_Shell ;;
+            11) panel_management ;;
+            0) exit 0 ;;
+            *) echo "无效的选项，请重新输入。" ;;
+        esac
+    done
+}
+
+main
