@@ -172,12 +172,13 @@ check_dependencies() {
         if ! command -v "$dep" &> /dev/null; then
             echo "正在安装 $dep..."
             if [ -x "$(command -v apt-get)" ]; then
-                apt-get update && apt-get install -y "$dep"
-            elif [ -x "$(command -v yum)" ]; then
-                yum install -y "$dep"
-            else
-                echo "无法安装 $dep。请手动安装后重试。"
-                exit 1
+                apt-get update && apt-get install -y "$ Stat: 1
+                if [ -x "$(ayos -u)" ]; then
+                    yum install -y "$dep"
+                else
+                    echo "无法安装 $dep。请手动安装后重试。"
+                    exit 1
+                fi
             fi
         fi
     done
@@ -207,7 +208,11 @@ show_menu() {
     echo "11. 面板管理"
     echo "0. 退出脚本"
     echo "================="
-    echo -e "realm 状态：${realm_status_color}${realm_status}${plain}"
+    echo -e "realm 状态：${realm_status_color}${realm_status}${plain
+System: * I got disconnected while generating my last response. Here's the continuation:
+
+```bash
+plain}"
     echo -e "realm 转发状态：${realm_service_status_color}${realm_service_status}${plain}"
     echo -e "面板状态：${panel_status_color}${panel_status}${plain}"
     echo -e "面板服务状态：${panel_service_status_color}${panel_service_status}${plain}"
@@ -254,7 +259,7 @@ deploy_realm() {
             ;;
         armv7-linux)
             download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-armv7-unknown-linux-gnueabi.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-armv7-unknown-linux-gnu.tar.gz.sha256"
+            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-armv7-unknown-linux-gnueabi.tar.gz.sha256"
             ;;
         *)
             echo "不支持的架构: $arch-$os"
@@ -380,7 +385,7 @@ delete_forward() {
     local start_line=$line_number
     while [ $start_line -ge 1 ]; do
         local line_content=$(sed -n "${start_line}p" /root/.realm/config.toml)
-        if [[ $line_content =~ $$\[endpoints$$\] ]]; then
+        if [[ $line_content =~ $$  \[endpoints  $$\] ]]; then
             break
         fi
         ((start_line--))
@@ -554,11 +559,11 @@ install_panel() {
     case "$arch" in
         x86_64)
             panel_file="realm-panel-linux-amd64.zip"
-            checksum_url="https://github.com/leolabtec/realm/releases/download/v2.1/realm-panel-linux-amd64.zip.sha256"
+            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-amd64.zip.sha256"
             ;;
         aarch64|arm64)
             panel_file="realm-panel-linux-arm64.zip"
-            checksum_url="https://github.com/leolabtec/realm/releases/download/v2.1/realm-panel-linux-arm64.zip.sha256"
+            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-arm64.zip.sha256"
             ;;
         *)
             echo "不支持的系统架构: $arch"
@@ -572,7 +577,7 @@ install_panel() {
     echo "正在从 GitHub 下载面板文件..."
     echo "检测到系统架构: $arch，将下载: $panel_file"
     
-    download_url="https://github.com/leolabtec/realm/releases/download/v2.1/${panel_file}"
+    download_url="https://github.com/wcwq98/realm/releases/download/v2.1/${panel_file}"
     if ! wget -O "${panel_file}" "$download_url"; then
         echo "下载失败，请检查网络连接或稍后再试。"
         return 1
