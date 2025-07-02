@@ -1,11 +1,10 @@
 [auth]
-password = "123456" # 面板密码
+password = "" # 安装时由用户设置或自动生成
 
 [server]
-port = 8081 # 面板端口
+port = 8081
 
 [https]
-enabled = false #是否开启HTTPS
-cert_file = "./certificate/cert.pem"
-key_file = "./certificate/private.key"
-
+enabled = true
+cert_file = "/root/realm/web/certificate/cert.pem"
+key_file = "/root/realm/web/certificate/private.key"
