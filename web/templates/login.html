@@ -1,191 +1,59 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Realm 转发管理面板 - 登录</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f4f4f4;
-            height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .login-container {
-            max-width: 400px;
-            width: 100%;
-            background-color: #fff;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        h1 {
-            color: #333;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            color: #666;
-        }
-        .form-group input {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-sizing: border-box;
-            font-size: 16px;
-        }
-        .password-input-wrapper {
-            position: relative;
-        }
-        .password-toggle {
-            position: absolute;
-            right: 10px;
-            top: 50%;
-            transform: translateY(-50%);
-            background: none;
-            border: none;
-            cursor: pointer;
-            color: #666;
-            padding: 5px;
-            font-size: 20px;
-        }
-        button[type="submit"] {
-            width: 100%;
-            padding: 12px;
-            background-color: #28a745;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-            transition: background-color 0.3s;
-        }
-        button[type="submit"]:hover {
-            background-color: #218838;
-        }
-        .error-message {
-            color: #dc3545;
-            margin-top: 15px;
-            text-align: center;
-            min-height: 20px;
-            font-size: 14px;
-        }
-        .loading {
-            opacity: 0.7;
-            cursor: not-allowed;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        .loading-spinner {
-            display: none;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #28a745;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 10px auto;
-        }
-    </style>
+    <title>Realm 转发管理面板</title>
+    <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="login-container">
-        <h1>Realm 转发管理面板</h1>
+    <div class="container">
+        <h1>登录</h1>
         <form id="loginForm">
+            <input type="hidden" id="csrf_token" name="csrf_token" value="{{.csrf_token}}">
             <div class="form-group">
-                <div class="password-input-wrapper">
-                    <input 
-                        type="password" 
-                        id="password" 
-                        placeholder="请输入密码" 
-                        required 
-                        autocomplete="current-password"
-                        minlength="4"
-                    >
-                    <button 
-                        type="button" 
-                        class="password-toggle" 
-                        id="togglePassword" 
-                        aria-label="切换密码显示"
-                    >👁</button>
-                </div>
+                <label for="password">密码:</label>
+                <input type="password" id="password" name="password" required>
+                <span class="toggle-password">👁</span>
             </div>
-            <button type="submit" id="submitButton">登录</button>
-            <div class="loading-spinner" id="loadingSpinner"></div>
-            <div id="errorMessage" class="error-message"></div>
+            <button type="submit">登录</button>
         </form>
+        <div id="output"></div>
     </div>
-
     <script>
-        const form = document.getElementById('loginForm');
-        const passwordInput = document.getElementById('password');
-        const toggleButton = document.getElementById('togglePassword');
-        const submitButton = document.getElementById('submitButton');
-        const errorMessage = document.getElementById('errorMessage');
-        const loadingSpinner = document.getElementById('loadingSpinner');
-
-        // 密码显示切换
-        toggleButton.addEventListener('click', function() {
-            const type = passwordInput.type === 'password' ? 'text' : 'password';
-            passwordInput.type = type;
-            this.textContent = type === 'password' ? '👁' : '👁‍🗨';
-        });
-
-        // 登录表单提交
-        form.addEventListener('submit', async function(e) {
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            errorMessage.textContent = '';
-            submitButton.disabled = true;
-            submitButton.classList.add('loading');
-            loadingSpinner.style.display = 'block';
-            
+            const password = document.getElementById('password').value;
+            const csrfToken = document.getElementById('csrf_token').value;
+            const output = document.getElementById('output');
+            if (password.length < 8) {
+                output.textContent = '密码必须至少8位';
+                return;
+            }
             try {
                 const response = await fetch('/login', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrfToken
                     },
-                    body: JSON.stringify({ 
-                        password: passwordInput.value 
-                    }),
+                    body: JSON.stringify({ password })
                 });
-
                 const data = await response.json();
-                
                 if (response.ok) {
                     window.location.href = '/';
                 } else {
-                    throw new Error(data.error || '密码错误');
+                    output.textContent = data.error || '登录失败';
                 }
             } catch (error) {
-                errorMessage.textContent = error.message || '登录失败，请重试';
-            } finally {
-                submitButton.disabled = false;
-                submitButton.classList.remove('loading');
-                loadingSpinner.style.display = 'none';
+                output.textContent = '登录失败: ' + error.message;
             }
         });
 
-        // 页面加载完成后聚焦密码输入框
-        window.addEventListener('load', () => {
-            passwordInput.focus();
-        });
-
-        // 清除之前的错误信息
-        passwordInput.addEventListener('input', () => {
-            errorMessage.textContent = '';
+        document.querySelector('.toggle-password').addEventListener('click', () => {
+            const passwordInput = document.getElementById('password');
+            const type = passwordInput.type === 'password' ? 'text' : 'password';
+            passwordInput.type = type;
         });
     </script>
 </body>
