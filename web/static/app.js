@@ -18,6 +18,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const pageSizeSelect = document.getElementById('pageSizeSelect');
 
+    async function getCSRFToken() {
+        const response = await fetch('/get_csrf_token');
+        const data = await response.json();
+        return data.csrf_token;
+    }
+
     async function updateServiceStatus() {
         try {
             const response = await fetch('/check_status');
@@ -92,13 +98,23 @@ document.addEventListener('DOMContentLoaded', () => {
             const remotePort = remote.substring(lastColonIndex + 1);
 
             const row = document.createElement('tr');
-            row.innerHTML = `
-                <td>${index + 1}</td>
-                <td>${localPort}</td>
-                <td>${remoteIP}</td>
-                <td>${remotePort}</td>
-                <td><button class="delete-btn" data-listen="${listen}">删除</button></td>
-            `;
+            const cells = [
+                document.createElement('td'),
+                document.createElement('td'),
+                document.createElement('td'),
+                document.createElement('td'),
+                document.createElement('td')
+            ];
+            cells[0].textContent = index + 1;
+            cells[1].textContent = localPort;
+            cells[2].textContent = remoteIP;
+            cells[3].textContent = remotePort;
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'delete-btn';
+            deleteButton.textContent = '删除';
+            deleteButton.dataset.listen = listen;
+            cells[4].appendChild(deleteButton);
+            row.append(...cells);
             tbody.appendChild(row);
         });
 
@@ -137,8 +153,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function deleteRule(listenAddress) {
         try {
+            const csrfToken = await getCSRFToken();
             const response = await fetch(`/delete_rule?listen=${encodeURIComponent(listenAddress)}`, {
-                method: 'DELETE'
+                method: 'DELETE',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
 
             if (!response.ok) {
@@ -146,7 +166,10 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             const restartResponse = await fetch('/restart_service', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (!restartResponse.ok) {
                 throw new Error('重启服务失败：' + restartResponse.statusText);
@@ -171,6 +194,16 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        if (!/^\d+$/.test(localPort) || !/^\d+$/.test(remotePort) || parseInt(localPort) < 1 || parseInt(localPort) > 65535 || parseInt(remotePort) < 1 || parseInt(remotePort) > 65535) {
+            outputDiv.textContent = '端口必须为1-65535之间的数字';
+            return;
+        }
+
+        if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(remoteIP) && !/^[0-9a-fA-F:]+$/.test(remoteIP)) {
+            outputDiv.textContent = '无效的 IP 地址';
+            return;
+        }
+
         try {
             const usedPorts = new Set(allRules.map(r => r.listen.split(':')[1]));
             if (usedPorts.has(localPort)) {
@@ -178,10 +211,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
+            const csrfToken = await getCSRFToken();
             const response = await fetch('/add_rule', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken
                 },
                 body: JSON.stringify({
                     listen: `0.0.0.0:${localPort}`,
@@ -194,7 +229,10 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             const restartResponse = await fetch('/restart_service', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (!restartResponse.ok) {
                 throw new Error('重启服务失败：' + restartResponse.statusText);
@@ -239,10 +277,12 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             try {
+                const csrfToken = await getCSRFToken();
                 const response = await fetch('/add_rule', {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrfToken
                     },
                     body: JSON.stringify({
                         listen: `0.0.0.0:${localPort}`,
@@ -264,8 +304,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (hasSuccess) {
             try {
+                const csrfToken = await getCSRFToken();
                 const restartResponse = await fetch('/restart_service', {
-                    method: 'POST'
+                    method: 'POST',
+                    headers: {
+                        'X-CSRF-Token': csrfToken
+                    }
                 });
                 if (!restartResponse.ok) {
                     throw new Error('重启服务失败');
@@ -288,8 +332,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     startButton.addEventListener('click', async () => {
         try {
+            const csrfToken = await getCSRFToken();
             const response = await fetch('/start_service', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (!response.ok) {
                 throw new Error('启动服务失败：' + response.statusText);
@@ -304,8 +352,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     stopButton.addEventListener('click', async () => {
         try {
+            const csrfToken = await getCSRFToken();
             const response = await fetch('/stop_service', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (!response.ok) {
                 throw new Error('停止服务失败：' + response.statusText);
@@ -320,8 +372,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     restartButton.addEventListener('click', async () => {
         try {
+            const csrfToken = await getCSRFToken();
             const response = await fetch('/restart_service', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (!response.ok) {
                 throw new Error('重启服务失败：' + response.statusText);
@@ -336,8 +392,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     logoutButton.addEventListener('click', async () => {
         try {
+            const csrfToken = await getCSRFToken();
             const response = await fetch('/logout', {
-                method: 'POST'
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': csrfToken
+                }
             });
             if (response.ok) {
                 window.location.href = '/login';
