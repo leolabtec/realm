@@ -1,720 +1,582 @@
 #!/bin/bash
 
-# 定义颜色变量
+# ========== Realm 中转管理脚本 v2.7 ==========
+# 功能特点：
+# 1. 完整支持 CLI 参数和交互式菜单
+# 2. 支持端口段转发和单端口转发
+# 3. 集成面板管理（安装/启停）
+# 4. 自动生成 HTTPS 证书
+# 5. 完善的日志记录和错误处理
+# 6. 支持脚本自更新和程序更新
+# 7. 完整的服务管理功能
+
+# ===== 基础配置 =====
+sh_ver="2.7"
 red="\033[0;31m"
 green="\033[0;32m"
+yellow="\033[1;33m"
+blue="\033[0;34m"
 plain="\033[0m"
 
-# 脚本版本
-sh_ver="2.1"
+# 路径配置
+CONFIG_PATH="/root/.realm/config.toml"
+PANEL_CONFIG="/root/realm/web/config.toml"
+CERT_PATH="/root/realm/web/certs"
+LOG_FILE="/var/log/realm_manager.log"
+SCRIPT_URL="https://raw.githubusercontent.com/wcwq98/realm/main/realm.sh"
+REALM_BIN="/usr/local/bin/realm"
+SERVICE_FILE="/etc/systemd/system/realm.service"
+PANEL_SERVICE="/etc/systemd/system/realm-panel.service"
 
-# 初始化环境目录
+# ===== 初始化环境 =====
 init_env() {
-    mkdir -p /root/realm
-    mkdir -p /root/.realm
-    chmod 700 /root/realm /root/.realm
+    mkdir -p /root/.realm /root/realm/web "$CERT_PATH"
+    touch "$CONFIG_PATH" "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
 }
 
-# 配置文件路径
-CONFIG_PATH="/root/.realm/config.toml"
+# ===== 日志记录 =====
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    case $level in
+        "INFO") color="$green" ;;
+        "WARN") color="$yellow" ;;
+        "ERROR") color="$red" ;;
+        "DEBUG") color="$blue" ;;
+        *) color="$plain" ;;
+    esac
+    
+    echo -e "${color}[${timestamp}] [${level}] ${message}${plain}"
+    echo "[${timestamp}] [${level}] ${message}" >> "$LOG_FILE"
+}
 
-# 验证 IP 地址
+# ===== 依赖检查 =====
+check_dependencies() {
+    local deps=(wget curl tar systemctl sed grep unzip awk openssl ss iproute2)
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        log "WARN" "缺少依赖: ${missing[*]}，尝试安装..."
+        
+        if command -v apt-get &>/dev/null; then
+            apt-get update -q && apt-get install -y -q "${missing[@]}" || {
+                log "ERROR" "依赖安装失败！"
+                exit 1
+            }
+        elif command -v yum &>/dev/null; then
+            yum install -y -q "${missing[@]}" || {
+                log "ERROR" "依赖安装失败！"
+                exit 1
+            }
+        else
+            log "ERROR" "不支持的包管理器，请手动安装依赖: ${missing[*]}"
+            exit 1
+        fi
+    fi
+}
+
+# ===== 参数校验 =====
 validate_ip() {
     local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $ip =~ ^\[?[0-9a-fA-F:]+\]?$ ]]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    
+    local IFS='.'
+    local -a octets=($ip)
+    for octet in "${octets[@]}"; do
+        [[ $octet -le 255 ]] || return 1
+    done
+    
+    return 0
 }
 
-# 验证端口
 validate_port() {
-    local port=$1
-    if [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# 处理命令行参数
-while getopts "l:r:" opt; do
-  case $opt in
-    l)
-      listen_ip_port="$OPTARG"
-      if ! validate_ip_port "$listen_ip_port"; then
-        echo "无效的监听地址: $listen_ip_port"
-        exit 1
-      fi
-      ;;
-    r)
-      remote_ip_port="$OPTARG"
-      if ! validate_ip_port "$remote_ip_port"; then
-        echo "无效的远程地址: $remote_ip_port"
-        exit 1
-      fi
-      ;;
-    *)
-      echo "用法: $0 [-l listen_ip:port] [-r remote_ip:port]"
-      exit 1
-      ;;
-  esac
-done
-
-# 验证 IP:端口格式
 validate_ip_port() {
     local input=$1
-    local ip=$(echo "$input" | cut -d: -f1)
-    local port=$(echo "$input" | cut -d: -f2)
-    validate_ip "$ip" && validate_port "$port"
-}
-
-# 如果提供了 -l 和 -r 参数，追加配置到 config.toml
-if [ -n "$listen_ip_port" ] && [ -n "$remote_ip_port" ]; then
-    echo "配置中转机 IP 和端口为: $listen_ip_port"
-    echo "配置落地机 IP 和端口为: $remote_ip_port"
-
-    cat <<EOF >> "$CONFIG_PATH"
-
-[[endpoints]]
-listen = "$listen_ip_port"
-remote = "$remote_ip_port"
-EOF
-    chmod 600 "$CONFIG_PATH"
-    echo "配置已追加，listen = $listen_ip_port，remote = $remote_ip_port"
-    exit 0
-fi
-
-# 更新 realm 状态
-update_realm_status() {
-    if [ -f "/root/realm/realm" ]; then
-        realm_status="已安装"
-        realm_status_color=$green
+    local ip_port_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'
+    
+    if [[ $input =~ $ip_port_regex ]]; then
+        local ip=${input%:*}
+        local port=${input#*:}
+        validate_ip "$ip" && validate_port "$port"
     else
-        realm_status="未安装"
-        realm_status_color=$red
-    fi
-}
-
-# 检查 realm 服务状态
-check_realm_service_status() {
-    if systemctl is-active --quiet realm; then
-        realm_service_status="启用"
-        realm_service_status_color=$green
-    else
-        realm_service_status="未启用"
-        realm_service_status_color=$red
-    fi
-}
-
-# 更新面板状态
-update_panel_status() {
-    if [ -f "/root/realm/web/realm_web" ]; then
-        panel_status="已安装"
-        panel_status_color=$green
-    else
-        panel_status="未安装"
-        panel_status_color=$red
-    fi
-}
-
-# 检查面板服务状态
-check_panel_service_status() {
-    if systemctl is-active --quiet realm-panel; then
-        panel_service_status="启用"
-        panel_service_status_color=$green
-    else
-        panel_service_status="未启用"
-        panel_service_status_color=$red
-    fi
-}
-
-# 更新脚本
-Update_Shell() {
-    echo -e "当前脚本版本为 [ ${sh_ver} ]，开始检测最新版本..."
-    sh_new_ver=$(wget --no-check-certificate -qO- "https://raw.githubusercontent.com/leolabtec/realm/main/realm.sh" | grep 'sh_ver="' | awk -F "=" '{print $NF}' | sed 's/\"//g' | head -1)
-    if [[ -z ${sh_new_ver} ]]; then
-        echo -e "${red}检测最新版本失败！请检查网络或稍后再试。${plain}"
         return 1
     fi
+}
+
+# ===== 端口检测 =====
+check_port() {
+    local port=$1
+    if ss -tuln | grep -q ":${port} "; then
+        log "WARN" "端口 ${port} 已被占用"
+        return 1
+    fi
+    return 0
+}
+
+# ===== CLI 参数处理 =====
+handle_cli_params() {
+    while getopts "l:r:a:d:uih" opt; do
+        case $opt in
+            l) listen_ip_port="$OPTARG" ;;
+            r) remote_ip_port="$OPTARG" ;;
+            a) add_rule "$OPTARG" ;;
+            d) delete_rule "$OPTARG" ;;
+            u) update_script ;;
+            i) install_realm ;;
+            h) show_help; exit 0 ;;
+            *) show_help; exit 1 ;;
+        esac
+    done
+
+    if [[ -n "$listen_ip_port" && -n "$remote_ip_port" ]]; then
+        if ! validate_ip_port "$listen_ip_port" || ! validate_ip_port "$remote_ip_port"; then
+            log "ERROR" "输入格式无效，请使用 IP:端口 格式"
+            exit 1
+        fi
+        
+        local port=${listen_ip_port#*:}
+        if ! check_port "$port"; then
+            exit 1
+        fi
+        
+        add_single_rule "$listen_ip_port" "$remote_ip_port"
+        exit 0
+    fi
+}
+
+# ===== 添加转发规则 =====
+add_single_rule() {
+    local listen=$1
+    local remote=$2
     
-    if [[ ${sh_new_ver} == ${sh_ver} ]]; then
-        echo -e "当前已是最新版本 [ ${sh_new_ver} ]！"
+    echo -e "\n[[endpoints]]\nlisten = \"${listen}\"\nremote = \"${remote}\"" >> "$CONFIG_PATH"
+    log "INFO" "添加成功：${listen} → ${remote}"
+    
+    # 自动重启服务
+    if systemctl is-active --quiet realm; then
+        systemctl restart realm
+        log "INFO" "已重启 realm 服务"
+    fi
+}
+
+add_port_range_forward() {
+    read -p "请输入落地 IP: " ip
+    read -p "请输入起始端口: " start_port
+    read -p "请输入结束端口: " end_port
+    read -p "请输入落地端口: " remote_port
+
+    if ! validate_ip "$ip"; then
+        log "ERROR" "IP 格式错误"
+        return 1
+    fi
+
+    if ! validate_port "$start_port" || ! validate_port "$end_port" || ! validate_port "$remote_port"; then
+        log "ERROR" "端口格式错误"
+        return 1
+    fi
+
+    if (( start_port > end_port )); then
+        log "ERROR" "起始端口不能大于结束端口"
+        return 1
+    fi
+
+    local added=0
+    for ((port=start_port; port<=end_port; port++)); do
+        if check_port "$port"; then
+            add_single_rule "0.0.0.0:${port}" "${ip}:${remote_port}"
+            ((added++))
+        fi
+    done
+
+    log "INFO" "成功添加 ${added} 条转发规则"
+}
+
+# ===== 删除转发规则 =====
+delete_rule() {
+    local target=$1
+    
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        log "ERROR" "配置文件不存在: $CONFIG_PATH"
+        return 1
+    fi
+
+    local lines=()
+    while IFS= read -r line; do
+        lines+=("$line")
+    done < <(grep -n 'listen =' "$CONFIG_PATH" | grep -v '#' | awk -F: '{print $1}')
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        log "INFO" "未发现转发规则"
         return 0
     fi
-    
-    echo -e "发现新版本 [ ${sh_new_ver} ]，是否更新？[Y/n]"
-    read -p "(默认: y): " yn
-    yn=${yn:-y}
-    if [[ ${yn} =~ ^[Yy]$ ]]; then
-        cp realm.sh realm.sh.bak
-        wget -N --no-check-certificate https://raw.githubusercontent.com/leolabtec/realm/main/realm.sh -O realm.sh
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载脚本失败，请检查网络连接！${plain}"
-            mv realm.sh.bak realm.sh
-            return 1
-        fi
-        chmod +x realm.sh
-        echo -e "脚本已更新为最新版本 [ ${sh_new_ver} ]！"
-        exec bash realm.sh
-    else
-        echo -e "已取消更新。"
-    fi
-}
 
-# 检查依赖
-check_dependencies() {
-    echo "正在检查当前环境依赖"
-    local dependencies=("wget" "tar" "systemctl" "sed" "grep" "curl" "unzip" "openssl")
-
-    for dep in "${dependencies[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            echo "正在安装 $dep..."
-            if [ -x "$(command -v apt-get)" ]; then
-                apt-get update && apt-get install -y "$ Stat: 1
-                if [ -x "$(ayos -u)" ]; then
-                    yum install -y "$dep"
-                else
-                    echo "无法安装 $dep。请手动安装后重试。"
-                    exit 1
-                fi
-            fi
-        fi
-    done
-
-    echo "所有依赖已满足。"
-}
-
-# 显示菜单的函数
-show_menu() {
-    clear
-    update_realm_status
-    check_realm_service_status
-    update_panel_status
-    check_panel_service_status
-    echo "欢迎使用 realm 一键转发脚本"
-    echo "================="
-    echo "1. 部署环境"
-    echo "2. 添加转发"
-    echo "3. 添加端口段转发"
-    echo "4. 删除转发"
-    echo "5. 启动服务"
-    echo "6. 停止服务"
-    echo "7. 重启服务"
-    echo "8. 检测更新"
-    echo "9. 一键卸载"
-    echo "10. 更新脚本"
-    echo "11. 面板管理"
-    echo "0. 退出脚本"
-    echo "================="
-    echo -e "realm 状态：${realm_status_color}${realm_status}${plain
-System: * I got disconnected while generating my last response. Here's the continuation:
-
-```bash
-plain}"
-    echo -e "realm 转发状态：${realm_service_status_color}${realm_service_status}${plain}"
-    echo -e "面板状态：${panel_status_color}${panel_status}${plain}"
-    echo -e "面板服务状态：${panel_service_status_color}${panel_service_status}${plain}"
-}
-
-# 部署环境的函数
-deploy_realm() {
-    mkdir -p /root/realm
-    chmod 700 /root/realm
-    cd /root/realm
-
-    _version=$(curl -s https://api.github.com/repos/zhboner/realm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-
-    if [ -z "$_version" ]; then
-        echo "获取版本号失败，请检查本机能否链接 https://api.github.com/repos/zhboner/realm/releases/latest"
-        return 1
-    else
-        echo "当前最新版本为: ${_version}"
-    fi
-
-    arch=$(uname -m)
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-    case "$arch-$os" in
-        x86_64-linux)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-x86_64-unknown-linux-gnu.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-x86_64-unknown-linux-gnu.tar.gz.sha256"
-            ;;
-        x86_64-darwin)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-x86_64-apple-darwin.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-x86_64-apple-darwin.tar.gz.sha256"
-            ;;
-        aarch64-linux)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-aarch64-unknown-linux-gnu.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-aarch64-unknown-linux-gnu.tar.gz.sha256"
-            ;;
-        aarch64-darwin)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-aarch64-apple-darwin.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-aarch64-apple-darwin.tar.gz.sha256"
-            ;;
-        arm-linux)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-arm-unknown-linux-gnueabi.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-arm-unknown-linux-gnueabi.tar.gz.sha256"
-            ;;
-        armv7-linux)
-            download_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-armv7-unknown-linux-gnueabi.tar.gz"
-            checksum_url="https://github.com/zhboner/realm/releases/download/${_version}/realm-armv7-unknown-linux-gnueabi.tar.gz.sha256"
-            ;;
-        *)
-            echo "不支持的架构: $arch-$os"
-            return
-            ;;
-    esac
-
-    wget -O "/root/realm/realm-${_version}.tar.gz" "$download_url"
-    wget -O "/root/realm/realm-${_version}.tar.gz.sha256" "$checksum_url"
-    sha256sum -c "/root/realm/realm-${_version}.tar.gz.sha256"
-    if [[ $? -ne 0 ]]; then
-        echo "校验和验证失败，下载可能被篡改！"
-        exit 1
-    fi
-
-    tar -xvf "/root/realm/realm-${_version}.tar.gz" -C /root/realm/
-    chmod +x /root/realm/realm
-
-    # 创建 config.toml 模板
-    mkdir -p /root/.realm    
-    cat <<EOF > "$CONFIG_PATH"
-[network]
-no_tcp = false #是否关闭tcp转发
-use_udp = true #是否开启udp转发
-
-#参考模板
-# [[endpoints]]
-# listen = "0.0.0.0:本地端口"
-# remote = "落地鸡ip:目标端口"
-
-[[endpoints]]
-listen = "0.0.0.0:1234"
-remote = "0.0.0.0:5678"
-EOF
-    chmod 600 "$CONFIG_PATH"
-
-    # 创建非特权用户
-    useradd -r -s /bin/false realmuser 2>/dev/null || true
-
-    echo "[Unit]
-Description=realm
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
-
-[Service]
-Type=simple
-User=realmuser
-Group=realmuser
-Restart=on-failure
-RestartSec=5s
-WorkingDirectory=/root/realm
-ExecStart=/root/realm/realm -c /root/.realm/config.toml
-
-[Install]
-WantedBy=multi-user.target" > /etc/systemd/system/realm.service
-
-    systemctl daemon-reload
-    update_realm_status
-    echo "部署完成。"
-}
-
-# 卸载 realm
-uninstall_realm() {
-    systemctl stop realm
-    systemctl disable realm
-    rm -f /etc/systemd/system/realm.service
-    systemctl daemon-reload
-
-    rm -f /root/realm/realm
-    echo "realm 已被卸载。"
-
-    read -e -p "是否删除配置文件 (Y/N, 默认N): " delete_config
-    delete_config=${delete_config:-N}
-
-    if [[ $delete_config == "Y" || $delete_config == "y" ]]; then
-        rm -rf /root/realm
-        rm -rf /root/.realm
-        echo "配置文件已删除。"
-    else
-        echo "配置文件保留。"
-    fi
-
-    update_realm_status
-}
-
-# 删除转发规则的函数
-delete_forward() {
     echo "当前转发规则："
-    local lines=($(grep -n 'remote =' /root/.realm/config.toml | grep -v '#' | awk -F: '{print $1}'))
-    if [ ${#lines[@]} -eq 0 ]; then
-        echo "没有发现任何转发规则。"
-        return
-    fi
-    local index=1
-    for line_num in "${lines[@]}"; do
-        listen_line=$((line_num - 1))
-        listen_port=$(sed -n "${listen_line}p" /root/.realm/config.toml | cut -d '"' -f 2)
-        remote_port=$(sed -n "${line_num}p" /root/.realm/config.toml | cut -d '"' -f 2)
-        echo "${index}. 本地监听: ${listen_port} --> 远程目标: ${remote_port}"
-        let index+=1
+    for i in "${!lines[@]}"; do
+        local line_num=${lines[$i]}
+        local listen=$(sed -n "${line_num}p" "$CONFIG_PATH" | cut -d '"' -f 2)
+        local remote_line=$((line_num + 1))
+        local remote=$(sed -n "${remote_line}p" "$CONFIG_PATH" | cut -d '"' -f 2)
+        echo "$((i+1)). 监听: ${listen} -> 远程: ${remote}"
     done
 
-    echo "请输入要删除的转发规则序号，直接按回车返回主菜单。"
-    read -p "选择: " choice
-    if [ -z "$choice" ]; then
-        echo "返回主菜单。"
-        return
+    if [[ -n "$target" ]]; then
+        local sel=$target
+    else
+        read -p "请输入要删除的编号 (0取消): " sel
     fi
 
-    if ! [[ $choice =~ ^[0-9]+$ ]]; then
-        echo "无效输入，请输入数字。"
-        return
-    fi
-
-    if [ $choice -lt 1 ] || [ $choice -gt ${#lines[@]} ]; then
-        echo "选择超出范围，请输入有效序号。"
-        return
-    fi
-
-    local line_number=${lines[$((choice-1))]}
-
-    # 找到 [[endpoints]] 的起始行
-    local start_line=$line_number
-    while [ $start_line -ge 1 ]; do
-        local line_content=$(sed -n "${start_line}p" /root/.realm/config.toml)
-        if [[ $line_content =~ $$  \[endpoints  $$\] ]]; then
-            break
-        fi
-        ((start_line--))
-    done
-
-    # 删除从 start_line 开始的 3 行
-    sed -i "${start_line},$(($start_line+3))d" /root/.realm/config.toml
-    chmod 600 /root/.realm/config.toml
-
-    echo "转发规则已删除。"
-}
-
-# 添加转发规则
-add_forward() {
-    while true; do
-        read -e -p "请输入落地鸡的IP: " ip
-        if ! validate_ip "$ip"; then
-            echo "无效的 IP 地址: $ip"
-            continue
-        fi
-        read -e -p "请输入本地中转鸡的端口（port1）: " port1
-        if ! validate_port "$port1"; then
-            echo "无效的端口: $port1"
-            continue
-        fi
-        read -e -p "请输入落地鸡端口（port2）: " port2
-        if ! validate_port "$port2"; then
-            echo "无效的端口: $port2"
-            continue
-        fi
-        echo "
-[[endpoints]]
-listen = \"0.0.0.0:$port1\"
-remote = \"$ip:$port2\"" >> /root/.realm/config.toml
-        chmod 600 /root/.realm/config.toml
-
-        read -e -p "是否继续添加转发规则(Y/N)? " answer
-        if [[ $answer != "Y" && $answer != "y" ]]; then
-            break
-        fi
-    done
-}
-
-# 添加端口段转发
-add_port_range_forward() {
-    read -e -p "请输入落地鸡的IP: " ip
-    if ! validate_ip "$ip"; then
-        echo "无效的 IP 地址: $ip"
-        return
-    fi
-    read -e -p "请输入本地中转鸡的起始端口: " start_port
-    if ! validate_port "$start_port"; then
-        echo "无效的起始端口: $start_port"
-        return
-    fi
-    read -e -p "请输入本地中转鸡的截止端口: " end_port
-    if ! validate_port "$end_port" || [ "$end_port" -lt "$start_port" ]; then
-        echo "无效的截止端口或截止端口小于起始端口: $end_port"
-        return
-    fi
-    read -e -p "请输入落地鸡端口: " remote_port
-    if ! validate_port "$remote_port"; then
-        echo "无效的远程端口: $remote_port"
-        return
-    fi
-
-    for ((port=$start_port; port<=$end_port; port++)); do
-        echo "
-[[endpoints]]
-listen = \"0.0.0.0:$port\"
-remote = \"$ip:$remote_port\"" >> /root/.realm/config.toml
-    done
-    chmod 600 /root/.realm/config.toml
-
-    echo "端口段转发规则已添加。"
-}
-
-# 启动服务
-start_service() {
-    systemctl unmask realm.service
-    systemctl daemon-reload
-    systemctl restart realm.service
-    systemctl enable realm.service
-    echo "realm 服务已启动并设置为开机自启。"
-    check_realm_service_status
-}
-
-# 停止服务
-stop_service() {
-    systemctl stop realm.service
-    systemctl disable realm.service
-    echo "realm 服务已停止并已禁用开机自启。"
-    check_realm_service_status
-}
-
-# 重启服务
-restart_service() {
-    systemctl daemon-reload
-    systemctl restart realm.service
-    echo "realm 服务已重启。"
-    check_realm_service_status
-}
-
-# 更新 realm
-update_realm() {
-    echo "> 检测并更新 realm"
-
-    current_version=$(/root/realm/realm --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    tag_version=$(curl -Ls "https://api.github.com/repos/zhboner/realm/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-
-    if [[ -z "$tag_version" ]]; then
-        echo -e "${red}获取 realm 版本失败，可能是由于 GitHub API 限制，请稍后再试${plain}"
-        exit 1
-    fi
-
-    if [[ "$current_version" == "$tag_version" ]]; then
-        echo "当前已经是最新版本: ${current_version}"
-        return
-    fi
-
-    echo -e "获取到 realm 最新版本: ${tag_version}，开始安装..."
-
-    arch=$(uname -m)
-    wget -N --no-check-certificate -O /root/realm/realm.tar.gz "https://github.com/zhboner/realm/releases/download/${tag_version}/realm-${arch}-unknown-linux-gnu.tar.gz"
-    wget -O "/root/realm/realm-${tag_version}.tar.gz.sha256" "https://github.com/zhboner/realm/releases/download/${tag_version}/realm-${arch}-unknown-linux-gnu.tar.gz.sha256"
-    sha256sum -c "/root/realm/realm-${tag_version}.tar.gz.sha256"
-    if [[ $? -ne 0 ]]; then
-        echo "校验和验证失败，下载可能被篡改！"
-        exit 1
-    fi
-
-    cd /root/realm
-    tar -xvf realm.tar.gz
-    chmod +x realm
-
-    echo -e "realm 更新成功。"
-    update_realm_status
-}
-
-# 面板管理函数
-panel_management() {
-    clear
-    echo "==========================="
-    echo "Realm 面板管理"
-    echo "==========================="
-    echo "1. 启动面板"
-    echo "2. 暂停面板" 
-    echo "3. 安装面板"
-    echo "4. 卸载面板"
-    echo "5. 修改面板配置"
-    echo "0. 返回主菜单"
-    echo "==========================="
-    read -p "请选择操作 [0-5]: " panel_choice
-
-    case $panel_choice in
-        1) start_panel ;;
-        2) stop_panel ;;
-        3) install_panel ;;
-        4) uninstall_panel ;;
-        5) modify_panel_config ;;
-        0) return ;;
-        *) echo "无效的选择" ;;
-    esac
-}
-
-install_panel() {
-    echo "开始安装 Realm 面板..."
+    [[ $sel == "0" ]] && return 0
     
-    # 检测系统架构
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)
-            panel_file="realm-panel-linux-amd64.zip"
-            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-amd64.zip.sha256"
-            ;;
-        aarch64|arm64)
-            panel_file="realm-panel-linux-arm64.zip"
-            checksum_url="https://github.com/wcwq98/realm/releases/download/v2.1/realm-panel-linux-arm64.zip.sha256"
-            ;;
-        *)
-            echo "不支持的系统架构: $arch"
-            return 1
-            ;;
-    esac
-
-    cd /root/realm 
-
-    # 从 GitHub 下载面板文件
-    echo "正在从 GitHub 下载面板文件..."
-    echo "检测到系统架构: $arch，将下载: $panel_file"
-    
-    download_url="https://github.com/wcwq98/realm/releases/download/v2.1/${panel_file}"
-    if ! wget -O "${panel_file}" "$download_url"; then
-        echo "下载失败，请检查网络连接或稍后再试。"
+    if [[ $sel =~ ^[0-9]+$ ]] && (( sel > 0 && sel <= ${#lines[@]} )); then
+        local target_line=${lines[$((sel-1))]}
+        sed -i "$((target_line-1)),$((target_line+1))d" "$CONFIG_PATH"
+        log "INFO" "转发规则已删除"
+        
+        if systemctl is-active --quiet realm; then
+            systemctl restart realm
+            log "INFO" "已重启 realm 服务"
+        fi
+    else
+        log "ERROR" "无效的选择"
         return 1
     fi
-    wget -O "${panel_file}.sha256" "$checksum_url"
-    sha256sum -c "${panel_file}.sha256"
-    if [[ $? -ne 0 ]]; then
-        echo "校验和验证失败，下载可能被篡改！"
-        exit 1
+}
+
+# ===== 证书管理 =====
+generate_self_signed_cert() {
+    mkdir -p "$CERT_PATH"
+    local cert="${CERT_PATH}/cert.pem"
+    local key="${CERT_PATH}/key.pem"
+    local ip=$(hostname -I | awk '{print $1}')
+
+    if [[ -f "$cert" && -f "$key" ]]; then
+        log "INFO" "自签名证书已存在，跳过生成"
+        return 0
     fi
 
-    mkdir -p web
-    # 解压并设置权限
-    unzip "${panel_file}" -d /root/realm/web
-    cd web
-    chmod +x realm_web
-    chmod 700 /root/realm/web
+    log "INFO" "正在为 IP ${ip} 生成自签名 HTTPS 证书..."
+    
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$key" \
+        -out "$cert" \
+        -subj "/C=CN/ST=Realm/L=Realm/O=Realm/OU=Realm/CN=${ip}" || {
+        log "ERROR" "证书生成失败"
+        return 1
+    }
 
-    # 生成自签名证书
-    mkdir -p /root/realm/web/certificate
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /root/realm/web/certificate/private.key -out /root/realm/web/certificate/cert.pem -subj "/C=CN/ST=State/L=City/O=Organization/OU=Unit/CN=localhost"
-    chmod 600 /root/realm/web/certificate/*
+    log "INFO" "证书已生成: ${cert}"
+    return 0
+}
 
-    # 创建面板配置文件
-    random_password=$(openssl rand -base64 12)
-    echo "[auth]
-password = \"$random_password\"
+# ===== 面板管理 =====
+install_panel() {
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64) file="realm-panel-linux-amd64.zip" ;;
+        aarch64|arm64) file="realm-panel-linux-arm64.zip" ;;
+        *) log "ERROR" "不支持的架构: ${arch}"; return 1 ;;
+    esac
 
-[server]
-port = 8081
+    log "INFO" "检测到系统架构: ${arch}, 将下载: ${file}"
+    
+    mkdir -p /root/realm/web || return 1
+    cd /root/realm || return 1
 
-[https]
-enabled = true
-cert_file = \"/root/realm/web/certificate/cert.pem\"
-key_file = \"/root/realm/web/certificate/private.key\"" > /root/realm/web/config.toml
-    chmod 600 /root/realm/web/config.toml
+    log "INFO" "正在下载面板..."
+    if ! wget -O "$file" "https://github.com/wcwq98/realm/releases/download/v2.5/${file}"; then
+        log "ERROR" "面板下载失败"
+        return 1
+    fi
 
-    echo "面板密码为: $random_password，请保存！"
+    log "INFO" "正在解压面板文件..."
+    if ! unzip -o "$file" -d /root/realm/web; then
+        log "ERROR" "解压面板文件失败"
+        return 1
+    fi
+    
+    chmod +x /root/realm/web/realm_web
 
-    # 创建服务文件
-    echo "[Unit]
+    log "INFO" "正在创建面板服务..."
+    cat <<EOF > "$PANEL_SERVICE"
+[Unit]
 Description=Realm Web Panel
 After=network.target
 
 [Service]
 Type=simple
-User=realmuser
-Group=realmuser
-WorkingDirectory=/root/realm/web
 ExecStart=/root/realm/web/realm_web
-Restart=on-failure
+WorkingDirectory=/root/realm/web
+Restart=always
+User=root
 
 [Install]
-WantedBy=multi-user.target" > /etc/systemd/system/realm-panel.service
+WantedBy=multi-user.target
+EOF
 
-    systemctl daemon-reload
-    systemctl enable realm-panel
-    systemctl start realm-panel
-
-    update_panel_status
-    echo "Realm 面板安装完成。"
-}
-
-# 启动面板
-start_panel() {
-    systemctl start realm-panel
-    echo "面板服务已启动。"
-    check_panel_service_status
-}
-
-# 停止面板
-stop_panel() {
-    systemctl stop realm-panel
-    echo "面板服务已停止。"
-    check_panel_service_status
-}
-
-# 卸载面板
-uninstall_panel() {
-    systemctl stop realm-panel
-    systemctl disable realm-panel
-    rm -f /etc/systemd/system/realm-panel.service
-    systemctl daemon-reload
-
-    rm -rf /root/realm/web
-    echo "面板已被卸载。"
-
-    update_panel_status
-}
-
-# 修改面板配置
-modify_panel_config() {
-    echo "请输入新密码："
-    read -e -p "新密码: " new_password
-    if [[ -z "$new_password" || ${#new_password} -lt 8 ]]; then
-        echo "密码不能为空且至少8位。"
-        return
+    # 生成证书
+    if ! generate_self_signed_cert; then
+        log "ERROR" "HTTPS证书生成失败"
+        return 1
     fi
-    echo "[auth]
-password = \"$new_password\"
 
-[server]
-port = 8081
+    # 写入面板配置
+    cat <<EOF > "$PANEL_CONFIG"
+listen = "0.0.0.0:8080"
+tls_cert = "${CERT_PATH}/cert.pem"
+tls_key = "${CERT_PATH}/key.pem"
+EOF
 
-[https]
-enabled = true
-cert_file = \"/root/realm/web/certificate/cert.pem\"
-key_file = \"/root/realm/web/certificate/private.key\"" > /root/realm/web/config.toml
-    chmod 600 /root/realm/web/config.toml
-    echo "面板配置已修改。"
+    systemctl daemon-reload
+    systemctl enable realm-panel --now || {
+        log "ERROR" "面板服务启动失败"
+        return 1
+    }
+
+    log "INFO" "面板安装完成并已启动"
+    log "INFO" "面板访问地址: https://$(hostname -I | awk '{print $1}'):8080"
+    return 0
 }
 
-# 主程序
+panel_management() {
+    echo -e "\n${green}面板管理${plain}"
+    echo "1. 安装/更新面板"
+    echo "2. 启动面板"
+    echo "3. 停止面板"
+    echo "4. 重启面板"
+    echo "5. 查看面板状态"
+    echo "0. 返回主菜单"
+    
+    read -p "请选择操作: " choice
+    case $choice in
+        1) install_panel ;;
+        2) systemctl start realm-panel && log "INFO" "面板已启动" ;;
+        3) systemctl stop realm-panel && log "INFO" "面板已停止" ;;
+        4) systemctl restart realm-panel && log "INFO" "面板已重启" ;;
+        5) systemctl status realm-panel --no-pager ;;
+        0) return ;;
+        *) log "ERROR" "无效选择" ;;
+    esac
+}
+
+# ===== Realm 安装/更新 =====
+install_realm() {
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64) file="realm-x86_64-unknown-linux-gnu.tar.gz" ;;
+        aarch64) file="realm-aarch64-unknown-linux-gnu.tar.gz" ;;
+        *) log "ERROR" "不支持的架构: ${arch}"; return 1 ;;
+    esac
+
+    log "INFO" "正在下载 realm..."
+    if ! wget -O realm.tar.gz "https://github.com/zhboner/realm/releases/latest/download/${file}"; then
+        log "ERROR" "下载失败"
+        return 1
+    fi
+
+    log "INFO" "正在解压安装..."
+    tar -xzf realm.tar.gz && chmod +x realm
+    mv realm "$REALM_BIN" || {
+        log "ERROR" "安装失败"
+        return 1
+    }
+
+    log "INFO" "正在创建服务文件..."
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=Realm Port Forwarding
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${REALM_BIN} -c ${CONFIG_PATH}
+WorkingDirectory=/root
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable realm --now || {
+        log "ERROR" "服务启动失败"
+        return 1
+    }
+
+    log "INFO" "realm 安装完成并已启动"
+    return 0
+}
+
+update_realm() {
+    if ! command -v "$REALM_BIN" &>/dev/null; then
+        log "ERROR" "realm 未安装，请先安装"
+        return 1
+    fi
+    
+    local current_ver=$("$REALM_BIN" --version | awk '{print $2}')
+    log "INFO" "当前版本: ${current_ver}"
+    
+    install_realm || return 1
+    
+    local new_ver=$("$REALM_BIN" --version | awk '{print $2}')
+    log "INFO" "成功更新到版本: ${new_ver}"
+}
+
+# ===== 服务管理 =====
+service_management() {
+    echo -e "\n${green}服务管理${plain}"
+    echo "1. 启动 Realm"
+    echo "2. 停止 Realm"
+    echo "3. 重启 Realm"
+    echo "4. 查看状态"
+    echo "0. 返回主菜单"
+    
+    read -p "请选择操作: " choice
+    case $choice in
+        1) systemctl start realm && log "INFO" "Realm 已启动" ;;
+        2) systemctl stop realm && log "INFO" "Realm 已停止" ;;
+        3) systemctl restart realm && log "INFO" "Realm 已重启" ;;
+        4) systemctl status realm --no-pager ;;
+        0) return ;;
+        *) log "ERROR" "无效选择" ;;
+    esac
+}
+
+# ===== 脚本自更新 =====
+update_script() {
+    log "INFO" "正在检查更新..."
+    local latest_url="https://raw.githubusercontent.com/wcwq98/realm/main/realm.sh"
+    local latest_ver=$(curl -s "$latest_url" | grep 'sh_ver="' | head -1 | sed -E 's/.*sh_ver="([^"]+)".*/\1/')
+    
+    if [[ -z "$latest_ver" ]]; then
+        log "ERROR" "获取最新版本失败"
+        return 1
+    fi
+    
+    if [[ "$latest_ver" == "$sh_ver" ]]; then
+        log "INFO" "当前已是最新版本 v${sh_ver}"
+        return 0
+    fi
+    
+    log "INFO" "发现新版本 v${latest_ver}，当前版本 v${sh_ver}"
+    read -p "是否更新？(Y/n): " yn
+    yn=${yn:-Y}
+    
+    if [[ $yn =~ ^[Yy]$ ]]; then
+        log "INFO" "正在更新脚本..."
+        if wget -O "$0" "$latest_url"; then
+            chmod +x "$0"
+            log "INFO" "更新成功，请重新运行脚本"
+            exit 0
+        else
+            log "ERROR" "更新失败"
+            return 1
+        fi
+    else
+        log "INFO" "已取消更新"
+    fi
+}
+
+# ===== 卸载功能 =====
+uninstall() {
+    read -p "确定要卸载 Realm 吗？(y/N): " yn
+    yn=${yn:-N}
+    
+    if [[ $yn =~ ^[Yy]$ ]]; then
+        log "INFO" "正在卸载 Realm..."
+        
+        systemctl stop realm realm-panel 2>/dev/null
+        systemctl disable realm realm-panel 2>/dev/null
+        rm -f "$SERVICE_FILE" "$PANEL_SERVICE" "$REALM_BIN"
+        rm -rf /root/.realm /root/realm
+        systemctl daemon-reload
+        
+        log "INFO" "Realm 已卸载"
+    else
+        log "INFO" "已取消卸载"
+    fi
+}
+
+# ===== 帮助信息 =====
+show_help() {
+    echo -e "${green}Realm 管理脚本 v${sh_ver} 使用说明${plain}"
+    echo "用法: $0 [选项]"
+    echo
+    echo "选项:"
+    echo "  -l <监听地址>   设置监听地址 (IP:端口)"
+    echo "  -r <远程地址>   设置远程地址 (IP:端口)"
+    echo "  -a              添加转发规则 (交互模式)"
+    echo "  -d              删除转发规则 (交互模式)"
+    echo "  -i              安装 Realm"
+    echo "  -u              更新脚本"
+    echo "  -h              显示帮助信息"
+    echo
+    echo "示例:"
+    echo "  $0 -l 0.0.0.0:1234 -r 1.1.1.1:4321  # 添加转发规则"
+    echo "  $0 -i                                # 安装 Realm"
+}
+
+# ===== 主菜单 =====
+show_menu() {
+    clear
+    echo -e "${green}Realm 中转管理脚本 v${sh_ver}${plain}"
+    echo "================================="
+    echo "1. 添加单端口转发"
+    echo "2. 添加端口段转发"
+    echo "3. 删除转发规则"
+    echo "4. 服务管理 (启动/停止/重启)"
+    echo "5. 面板管理 (安装/配置)"
+    echo "6. 安装/更新 Realm"
+    echo "7. 更新管理脚本"
+    echo "8. 卸载 Realm"
+    echo "0. 退出脚本"
+    echo "================================="
+}
+
+# ===== 主程序入口 =====
 main() {
     check_dependencies
     init_env
-
+    
+    # 处理 CLI 参数
+    if [[ $# -gt 0 ]]; then
+        handle_cli_params "$@"
+        exit $?
+    fi
+    
+    # 交互式菜单
     while true; do
         show_menu
-        read -p "请输入选项 [0-11]: " choice
-
-        case $choice in
-            1) deploy_realm ;;
-            2) add_forward ;;
-            3) add_port_range_forward ;;
-            4) delete_forward ;;
-            5) start_service ;;
-            6) stop_service ;;
-            7) restart_service ;;
-            8) update_realm ;;
-            9) uninstall_realm ;;
-            10) Update_Shell ;;
-            11) panel_management ;;
+        read -p "请输入选项 [0-8]: " num
+        
+        case $num in
+            1) add_single_rule "0.0.0.0" ;;
+            2) add_port_range_forward ;;
+            3) delete_rule ;;
+            4) service_management ;;
+            5) panel_management ;;
+            6) update_realm ;;
+            7) update_script ;;
+            8) uninstall ;;
             0) exit 0 ;;
-            *) echo "无效的选项，请重新输入。" ;;
+            *) log "ERROR" "无效选项" ;;
         esac
+        
+        read -p "按回车键继续..." -r
     done
 }
 
-main
+# 启动主程序
+main "$@"
